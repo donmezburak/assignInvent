@@ -5,9 +5,13 @@ const secretsClient = new SecretsManagerClient({});
 
 // Module-scope cache: reused across warm invocations of the same Lambda
 // container, so we don't re-fetch the secret or open a fresh connection
-// pool on every single batch. RDS Proxy is what makes it safe for many
-// concurrent *cold* containers to each hold a small pool without
-// exhausting Postgres' own max_connections.
+// pool on every single batch.
+//
+// No RDS Proxy in front of this (unavailable on this AWS account's plan —
+// see ADR.md, Scenario A): there's no pooler to absorb a burst of cold
+// containers each opening a connection at once. This account's own Lambda
+// concurrency ceiling (10 total, account-wide) ends up bounding the number
+// of simultaneous direct Postgres connections instead.
 let poolPromise: Promise<Pool> | undefined;
 
 async function buildPool(): Promise<Pool> {
@@ -17,13 +21,13 @@ async function buildPool(): Promise<Pool> {
   const { username, password } = JSON.parse(secret.SecretString ?? "{}");
 
   return new Pool({
-    host: process.env.DB_PROXY_ENDPOINT,
+    host: process.env.DB_HOST,
     port: 5432,
     database: process.env.DB_NAME,
     user: username,
     password,
     ssl: { rejectUnauthorized: false },
-    max: 2, // small per-container pool; RDS Proxy multiplexes across all containers
+    max: 1, // one direct connection per container; the account's concurrency ceiling bounds the total
     idleTimeoutMillis: 30_000,
   });
 }

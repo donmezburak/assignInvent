@@ -25,7 +25,7 @@ provider:
     BUCKET_NAME: !Ref VendorUploadsBucket
     BATCH_QUEUE_URL: !Ref IngestionBatchQueue
     DB_SECRET_ARN: !Ref DbSecret
-    DB_PROXY_ENDPOINT: !GetAtt DbProxy.Endpoint
+    DB_HOST: !GetAtt PostgresInstance.Endpoint.Address
     DB_NAME: modaco
     INGESTION_BATCH_SIZE: "2000"
   vpc:
@@ -64,7 +64,12 @@ functions:
     handler: src/handlers/processBatch.handler
     memorySize: 256
     timeout: 120
-    reservedConcurrency: 20 # caps concurrent RDS Proxy connections during a burst of batches
+    # No reservedConcurrency here: this AWS account's total Lambda concurrency
+    # limit is 10 (AccountLimit.ConcurrentExecutions), and AWS requires at
+    # least 10 to stay unreserved — reserving anything is arithmetically
+    # impossible on this account. That account-wide ceiling of 10 ends up
+    # being a stricter cap than the 20 originally intended anyway, so direct
+    # Postgres connections stay bounded regardless. See ADR.md, Scenario A.
     events:
       - sqs:
           arn: !GetAtt IngestionBatchQueue.Arn
@@ -184,7 +189,7 @@ resources:
     DbSecurityGroup:
       Type: AWS::EC2::SecurityGroup
       Properties:
-        GroupDescription: Postgres + RDS Proxy, reachable only from ingestion Lambdas and the bastion tunnel
+        GroupDescription: Postgres, reachable only from ingestion Lambdas and the bastion tunnel
         VpcId: !Ref IngestionVpc
         SecurityGroupIngress:
           - IpProtocol: tcp
@@ -209,7 +214,7 @@ resources:
     BastionSecurityGroup:
       Type: AWS::EC2::SecurityGroup
       Properties:
-        GroupDescription: DB tunnel bastion — no inbound rules; SSM Session Manager needs none
+        GroupDescription: DB tunnel bastion - no inbound rules; SSM Session Manager needs none
         VpcId: !Ref IngestionVpc
 
     BastionRole:
@@ -232,7 +237,7 @@ resources:
     BastionInstance:
       Type: AWS::EC2::Instance
       Properties:
-        InstanceType: t3.nano
+        InstanceType: t3.micro # this account's free-tier plan restricts allowed instance types; t3.nano was rejected
         ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
         SubnetId: !Ref PublicSubnet
         IamInstanceProfile: !Ref BastionInstanceProfile
@@ -242,10 +247,14 @@ resources:
 
     # --- Database -----------------------------------------------------------
     # Shares the same Postgres instance as the main Express API (see
-    # prisma/schema.prisma). Lambdas go through RDS Proxy instead of
-    # connecting directly: a burst of ~250 concurrent batch invocations would
-    # otherwise open 250 raw Postgres connections at once, which a small
-    # instance's max_connections cannot absorb. See ADR.md, Scenario A.
+    # prisma/schema.prisma). The original design put RDS Proxy in front of it
+    # so a burst of concurrent batch invocations wouldn't open a raw Postgres
+    # connection each all at once — RDS Proxy turned out to be unavailable on
+    # this AWS account's plan (discovered at deploy time). In its place, this
+    # account's own account-wide Lambda concurrency ceiling (10 total — see
+    # AccountLimit.ConcurrentExecutions) caps how many direct connections can
+    # ever be open at once, well under db.t4g.micro's max_connections. See
+    # ADR.md, Scenario A, for this trade-off.
     DbSecret:
       Type: AWS::SecretsManager::Secret
       Properties:
@@ -281,50 +290,6 @@ resources:
         BackupRetentionPeriod: 1
         MultiAZ: false
 
-    DbProxyIamRole:
-      Type: AWS::IAM::Role
-      Properties:
-        AssumeRolePolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Principal: { Service: rds.amazonaws.com }
-              Action: sts:AssumeRole
-        Policies:
-          - PolicyName: DbProxySecretAccess
-            PolicyDocument:
-              Version: "2012-10-17"
-              Statement:
-                - Effect: Allow
-                  Action: [secretsmanager:GetSecretValue]
-                  Resource: !Ref DbSecret
-
-    DbProxy:
-      Type: AWS::RDS::DBProxy
-      Properties:
-        DBProxyName: modaco-ingestion-proxy
-        EngineFamily: POSTGRESQL
-        RoleArn: !GetAtt DbProxyIamRole.Arn
-        VpcSubnetIds:
-          - !Ref PrivateSubnetA
-          - !Ref PrivateSubnetB
-        VpcSecurityGroupIds: [!Ref DbSecurityGroup]
-        RequireTLS: true
-        Auth:
-          - AuthScheme: SECRETS
-            SecretArn: !Ref DbSecret
-            IAMAuth: DISABLED
-
-    DbProxyTargetGroup:
-      Type: AWS::RDS::DBProxyTargetGroup
-      Properties:
-        DBProxyName: !Ref DbProxy
-        DBInstanceIdentifiers: [!Ref PostgresInstance]
-        TargetGroupName: default
-        ConnectionPoolConfigurationInfo:
-          MaxConnectionsPercent: 90
-          MaxIdleConnectionsPercent: 50
-
     # --- Storage & messaging --------------------------------------------
     VendorUploadsBucket:
       Type: AWS::S3::Bucket
@@ -354,8 +319,8 @@ resources:
       Value: !Ref VendorUploadsBucket
     IngestionBatchQueueUrl:
       Value: !Ref IngestionBatchQueue
-    DbProxyEndpoint:
-      Value: !GetAtt DbProxy.Endpoint
+    DbInstanceEndpoint:
+      Value: !GetAtt PostgresInstance.Endpoint.Address
     DbSecretArn:
       Value: !Ref DbSecret
     BastionInstanceId:
