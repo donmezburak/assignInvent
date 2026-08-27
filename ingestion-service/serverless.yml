@@ -28,6 +28,7 @@ provider:
     DB_HOST: !GetAtt PostgresInstance.Endpoint.Address
     DB_NAME: modaco
     INGESTION_BATCH_SIZE: "2000"
+    ALERTS_TOPIC_ARN: !Ref IngestionAlertsTopic
   vpc:
     securityGroupIds:
       - !Ref LambdaSecurityGroup
@@ -46,6 +47,9 @@ provider:
         - Effect: Allow
           Action: [secretsmanager:GetSecretValue]
           Resource: !Ref DbSecret
+        - Effect: Allow
+          Action: [sns:Publish]
+          Resource: !Ref IngestionAlertsTopic
 
 functions:
   splitFile:
@@ -75,6 +79,15 @@ functions:
           arn: !GetAtt IngestionBatchQueue.Arn
           batchSize: 1
           functionResponseType: ReportBatchItemFailures
+
+  handleFailedBatch:
+    handler: src/handlers/handleFailedBatch.handler
+    memorySize: 128
+    timeout: 30
+    events:
+      - sqs:
+          arn: !GetAtt IngestionBatchDLQ.Arn
+          batchSize: 1
 
 resources:
   Resources:
@@ -314,6 +327,41 @@ resources:
           deadLetterTargetArn: !GetAtt IngestionBatchDLQ.Arn
           maxReceiveCount: 3
 
+    # --- Observability ----------------------------------------------------
+    # A batch landing in the DLQ means its rows were never written and never
+    # will be without manual intervention — that must not be silent. The
+    # alarm fires on the DLQ itself as a backstop (visibility even if
+    # `handleFailedBatch` is somehow broken); `handleFailedBatch` fires the
+    # actual SNS message with the specific job/batch/row-count detail.
+    # Subscribe an endpoint (email, Slack webhook via a small subscriber
+    # Lambda, etc.) to this topic after deploy — deliberately not hardcoded
+    # here so a personal address doesn't end up committed to the repo.
+    IngestionAlertsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: modaco-ingestion-alerts-${self:provider.stage}
+
+    IngestionDlqAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmDescription: >-
+          A vendor-file batch permanently failed after 3 attempts and is
+          sitting in the ingestion dead-letter queue; its rows were never
+          written to the database.
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt IngestionBatchDLQ.QueueName
+        Statistic: Maximum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref IngestionAlertsTopic
+
   Outputs:
     VendorUploadsBucketName:
       Value: !Ref VendorUploadsBucket
@@ -325,3 +373,5 @@ resources:
       Value: !Ref DbSecret
     BastionInstanceId:
       Value: !Ref BastionInstance
+    IngestionAlertsTopicArn:
+      Value: !Ref IngestionAlertsTopic

@@ -16,6 +16,8 @@ export type SplitResult = {
 };
 
 const NEWLINE = 0x0a;
+const CARRIAGE_RETURN = 0x0d;
+const QUOTE = 0x22;
 
 /**
  * Streams a CSV object exactly once to find byte offsets that fall cleanly
@@ -23,6 +25,20 @@ const NEWLINE = 0x0a;
  * required to stay inside Lambda's memory limit for a 500k-row file. The
  * header row is excluded from every batch's range so `processBatch` can
  * parse each range as headerless, fixed-column CSV.
+ *
+ * Tracks whether we're inside a quoted field (RFC 4180: a quoted field can
+ * contain literal commas and newlines) and only treats a `\n` as a row
+ * boundary when we're not. A `""` escaped-quote pair toggles the flag twice
+ * in a row, netting no change — so plain quote-toggling handles escaping
+ * correctly without needing to special-case it. Without this, a vendor row
+ * like `"Multi\nLine Description"` would get its embedded newline mistaken
+ * for a row boundary, splitting one row into two corrupt ones.
+ *
+ * Also counts a final row that has no trailing newline (the file simply
+ * ends after it) — many export tools omit the last line's newline, and
+ * without this that entire last row would be silently uncounted: not in
+ * any batch, not in `totalRows`, never processed, and nothing would ever
+ * flag it as missing.
  *
  * Batch ranges are recorded (not the rows themselves): each batch is
  * re-fetched from S3 by the batch worker via an HTTP Range request, which
@@ -42,17 +58,27 @@ export async function computeBatchRanges(
   let totalRows = 0;
   let batchStartByte = -1;
   let sawHeader = false;
+  let inQuotes = false;
+  let sawContentSinceBoundary = false;
 
   for await (const chunk of body) {
     const buf = chunk as Buffer;
-    let searchFrom = 0;
 
-    for (;;) {
-      const idx = buf.indexOf(NEWLINE, searchFrom);
-      if (idx === -1) break;
+    for (let i = 0; i < buf.length; i++) {
+      const byte = buf[i];
 
-      const lineEndByte = bytesConsumed + idx + 1; // byte offset just past this line's \n
-      searchFrom = idx + 1;
+      if (byte === QUOTE) {
+        inQuotes = !inQuotes;
+        sawContentSinceBoundary = true;
+        continue;
+      }
+      if (byte !== NEWLINE || inQuotes) {
+        if (byte !== CARRIAGE_RETURN) sawContentSinceBoundary = true;
+        continue;
+      }
+
+      const lineEndByte = bytesConsumed + i + 1; // byte offset just past this line's \n
+      sawContentSinceBoundary = false;
 
       if (!sawHeader) {
         sawHeader = true;
@@ -76,6 +102,11 @@ export async function computeBatchRanges(
     }
 
     bytesConsumed += buf.length;
+  }
+
+  if (sawContentSinceBoundary) {
+    rowsInCurrentBatch += 1;
+    totalRows += 1;
   }
 
   if (rowsInCurrentBatch > 0) {
