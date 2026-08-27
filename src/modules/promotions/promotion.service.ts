@@ -1,6 +1,7 @@
 import { PromotionScope, PromotionStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { AppError } from "../../middleware/errorHandler";
+import { computeEffectivePrice } from "../pricing/pricing.engine";
 import { CreatePromotionInput } from "./promotion.dto";
 import * as promotionRepo from "./promotion.repository";
 
@@ -61,17 +62,35 @@ export async function cancelPromotion(id: string) {
 }
 
 /**
- * The promotion that actually applies to a product right now: a
- * product-specific promotion takes precedence over a category-wide one.
- * This is the precedence rule referenced in ADR.md for resolving
- * product-vs-category promotion conflicts.
+ * The promotion that actually applies to a product right now. A product can
+ * simultaneously have both a direct promotion and an active category-wide
+ * promotion (the conflict check only prevents two promotions in the *same*
+ * scope from overlapping — see `createPromotion`) — when both exist, this
+ * picks whichever produces the lower effective price for the customer,
+ * recomputed fresh on every call. That matters because a category
+ * promotion can be edited after a product promotion was created and become
+ * the better deal, or vice versa; a fixed "product always wins" rule would
+ * keep applying the worse discount until someone noticed. See ADR.md.
  */
 export async function resolveActivePromotionForProduct(
   productId: string,
   categoryId: string,
+  basePrice: number,
   at: Date = new Date(),
 ) {
-  const direct = await promotionRepo.findActiveProductPromotion(productId, at);
-  if (direct) return direct;
-  return promotionRepo.findActiveCategoryPromotion(categoryId, at);
+  const [direct, category] = await Promise.all([
+    promotionRepo.findActiveProductPromotion(productId, at),
+    promotionRepo.findActiveCategoryPromotion(categoryId, at),
+  ]);
+
+  if (!direct) return category;
+  if (!category) return direct;
+
+  const directPrice = computeEffectivePrice(basePrice, { discountType: direct.discountType, value: Number(direct.value) });
+  const categoryPrice = computeEffectivePrice(basePrice, {
+    discountType: category.discountType,
+    value: Number(category.value),
+  });
+
+  return directPrice <= categoryPrice ? direct : category;
 }

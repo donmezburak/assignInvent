@@ -25,8 +25,8 @@ export async function getProductById(id: string) {
   const product = await productRepo.findProductById(id);
   if (!product) throw new AppError(404, "PRODUCT_NOT_FOUND");
 
-  const activePromotion = await resolveActivePromotionForProduct(product.id, product.categoryId);
   const basePrice = Number(product.basePrice);
+  const activePromotion = await resolveActivePromotionForProduct(product.id, product.categoryId, basePrice);
   const effectivePrice = computeEffectivePrice(
     basePrice,
     activePromotion ? { discountType: activePromotion.discountType, value: Number(activePromotion.value) } : null,
