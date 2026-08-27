@@ -13,6 +13,7 @@ export function findOverlappingActive(
   startDate: Date,
   endDate: Date,
   tx: Prisma.TransactionClient | typeof prisma = prisma,
+  excludeId?: string,
 ) {
   const scopeFilter = scope === PromotionScope.PRODUCT ? { productId: targetId } : { categoryId: targetId };
 
@@ -22,7 +23,22 @@ export function findOverlappingActive(
       status: PromotionStatus.ACTIVE,
       startDate: { lt: endDate },
       endDate: { gt: startDate },
+      ...(excludeId ? { id: { not: excludeId } } : {}),
     },
+  });
+}
+
+/** Re-targets an existing promotion to a different product or category. */
+export function assignPromotionTarget(
+  id: string,
+  scope: PromotionScope,
+  productId: string | null,
+  categoryId: string | null,
+  tx: Prisma.TransactionClient | typeof prisma = prisma,
+) {
+  return tx.promotion.update({
+    where: { id },
+    data: { scope, productId, categoryId },
   });
 }
 

@@ -24,3 +24,16 @@ export const createPromotionSchema = z
   });
 
 export type CreatePromotionInput = z.infer<typeof createPromotionSchema>;
+
+/** Re-targets an existing promotion — separate from creation, per the case study's "create, cancel, and assign" wording. */
+export const assignPromotionSchema = z
+  .object({
+    productId: z.string().uuid().optional(),
+    categoryId: z.string().uuid().optional(),
+  })
+  .refine((data) => Boolean(data.productId) !== Boolean(data.categoryId), {
+    message: "Exactly one of productId or categoryId must be provided",
+    path: ["productId"],
+  });
+
+export type AssignPromotionInput = z.infer<typeof assignPromotionSchema>;

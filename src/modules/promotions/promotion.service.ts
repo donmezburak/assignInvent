@@ -2,7 +2,7 @@ import { PromotionScope, PromotionStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { AppError } from "../../middleware/errorHandler";
 import { computeEffectivePrice } from "../pricing/pricing.engine";
-import { CreatePromotionInput } from "./promotion.dto";
+import { AssignPromotionInput, CreatePromotionInput } from "./promotion.dto";
 import * as promotionRepo from "./promotion.repository";
 
 export async function createPromotion(input: CreatePromotionInput) {
@@ -59,6 +59,52 @@ export async function cancelPromotion(id: string) {
   }
 
   return promotionRepo.cancelPromotion(id);
+}
+
+/**
+ * Re-targets an existing promotion to a different product or category —
+ * distinct from `createPromotion`, per the case study's explicit "create,
+ * cancel, and assign" wording. Re-runs the same overlap check as creation
+ * (against the *new* target), excluding the promotion's own row so
+ * reassigning it to the target it already occupies isn't flagged as
+ * conflicting with itself.
+ */
+export async function assignPromotion(id: string, input: AssignPromotionInput) {
+  const promotion = await promotionRepo.findPromotionById(id);
+  if (!promotion) throw new AppError(404, "PROMOTION_NOT_FOUND");
+  if (promotion.status === PromotionStatus.CANCELLED) {
+    throw new AppError(409, "PROMOTION_CANCELLED", { message: "Cannot reassign a cancelled promotion." });
+  }
+
+  const scope = input.productId ? PromotionScope.PRODUCT : PromotionScope.CATEGORY;
+  const targetId = (input.productId ?? input.categoryId) as string;
+
+  if (scope === PromotionScope.PRODUCT) {
+    const product = await prisma.product.findUnique({ where: { id: targetId } });
+    if (!product) throw new AppError(404, "PRODUCT_NOT_FOUND");
+  } else {
+    const category = await prisma.category.findUnique({ where: { id: targetId } });
+    if (!category) throw new AppError(404, "CATEGORY_NOT_FOUND");
+  }
+
+  return prisma.$transaction(async (tx) => {
+    const overlapping = await promotionRepo.findOverlappingActive(
+      scope,
+      targetId,
+      promotion.startDate,
+      promotion.endDate,
+      tx,
+      id,
+    );
+    if (overlapping) {
+      throw new AppError(409, "PROMOTION_CONFLICT", {
+        message: "An active promotion already overlaps this date range for the given scope.",
+        conflictingPromotionId: overlapping.id,
+      });
+    }
+
+    return promotionRepo.assignPromotionTarget(id, scope, input.productId ?? null, input.categoryId ?? null, tx);
+  });
 }
 
 /**
