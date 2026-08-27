@@ -1,0 +1,362 @@
+service: modaco-ingestion
+
+frameworkVersion: "3"
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: false
+    exclude: [pg-native] # optional native binding pg tries to require(); we use the pure-JS driver
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'eu-central-1'}
+  stage: ${opt:stage, 'dev'}
+  profile: ${opt:profile, 'modaco'}
+  memorySize: 256
+  timeout: 60
+  environment:
+    STAGE: ${self:provider.stage}
+    BUCKET_NAME: !Ref VendorUploadsBucket
+    BATCH_QUEUE_URL: !Ref IngestionBatchQueue
+    DB_SECRET_ARN: !Ref DbSecret
+    DB_PROXY_ENDPOINT: !GetAtt DbProxy.Endpoint
+    DB_NAME: modaco
+    INGESTION_BATCH_SIZE: "2000"
+  vpc:
+    securityGroupIds:
+      - !Ref LambdaSecurityGroup
+    subnetIds:
+      - !Ref PrivateSubnetA
+      - !Ref PrivateSubnetB
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action: [s3:GetObject]
+          Resource: !Sub "${VendorUploadsBucket.Arn}/*"
+        - Effect: Allow
+          Action: [sqs:SendMessage]
+          Resource: !GetAtt IngestionBatchQueue.Arn
+        - Effect: Allow
+          Action: [secretsmanager:GetSecretValue]
+          Resource: !Ref DbSecret
+
+functions:
+  splitFile:
+    handler: src/handlers/splitFile.handler
+    memorySize: 512
+    timeout: 300
+    events:
+      - s3:
+          bucket: !Ref VendorUploadsBucket
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: vendor-files/
+          existing: true
+
+  processBatch:
+    handler: src/handlers/processBatch.handler
+    memorySize: 256
+    timeout: 120
+    reservedConcurrency: 20 # caps concurrent RDS Proxy connections during a burst of batches
+    events:
+      - sqs:
+          arn: !GetAtt IngestionBatchQueue.Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    # --- Networking -------------------------------------------------------
+    # Minimal, cost-conscious topology: one public subnet (NAT only) and two
+    # private subnets across two AZs (RDS requires >= 2 AZs for its subnet
+    # group even for a Single-AZ instance). A single NAT Gateway is a
+    # deliberate trade-off — see ADR.md, Scenario A infra section.
+    IngestionVpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.42.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        Tags:
+          - { Key: Name, Value: modaco-ingestion-vpc }
+
+    PublicSubnet:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref IngestionVpc
+        CidrBlock: 10.42.0.0/24
+        AvailabilityZone: !Select [0, !GetAZs ""]
+        MapPublicIpOnLaunch: true
+
+    PrivateSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref IngestionVpc
+        CidrBlock: 10.42.1.0/24
+        AvailabilityZone: !Select [0, !GetAZs ""]
+
+    PrivateSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref IngestionVpc
+        CidrBlock: 10.42.2.0/24
+        AvailabilityZone: !Select [1, !GetAZs ""]
+
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+
+    VpcGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: !Ref IngestionVpc
+        InternetGatewayId: !Ref InternetGateway
+
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref IngestionVpc
+
+    PublicRoute:
+      Type: AWS::EC2::Route
+      DependsOn: VpcGatewayAttachment
+      Properties:
+        RouteTableId: !Ref PublicRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: !Ref InternetGateway
+
+    PublicSubnetRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PublicSubnet
+        RouteTableId: !Ref PublicRouteTable
+
+    NatEip:
+      Type: AWS::EC2::EIP
+      Properties:
+        Domain: vpc
+
+    NatGateway:
+      Type: AWS::EC2::NatGateway
+      Properties:
+        AllocationId: !GetAtt NatEip.AllocationId
+        SubnetId: !Ref PublicSubnet
+
+    PrivateRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref IngestionVpc
+
+    PrivateRoute:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref PrivateRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId: !Ref NatGateway
+
+    PrivateSubnetARouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PrivateSubnetA
+        RouteTableId: !Ref PrivateRouteTable
+
+    PrivateSubnetBRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PrivateSubnetB
+        RouteTableId: !Ref PrivateRouteTable
+
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Ingestion Lambdas (splitFile, processBatch)
+        VpcId: !Ref IngestionVpc
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    DbSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Postgres + RDS Proxy, reachable only from ingestion Lambdas and the bastion tunnel
+        VpcId: !Ref IngestionVpc
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !Ref BastionSecurityGroup
+
+    # --- DB access tunnel ----------------------------------------------
+    # There is a single database (this RDS instance) for both the ingestion
+    # Lambdas and the main Express API — no separate local Postgres. Since
+    # the instance is private (PubliclyAccessible: false, correctly — it
+    # should never be open to the internet), the main API running on a
+    # developer's machine reaches it through an SSM port-forwarding session
+    # into this instance rather than a direct connection. No SSH key, no
+    # open inbound port: `aws ssm start-session` authenticates via IAM and
+    # tunnels over an outbound-only connection. See README.md for the
+    # exact command.
+    BastionSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: DB tunnel bastion — no inbound rules; SSM Session Manager needs none
+        VpcId: !Ref IngestionVpc
+
+    BastionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: { Service: ec2.amazonaws.com }
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+    BastionInstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        Roles: [!Ref BastionRole]
+
+    BastionInstance:
+      Type: AWS::EC2::Instance
+      Properties:
+        InstanceType: t3.nano
+        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+        SubnetId: !Ref PublicSubnet
+        IamInstanceProfile: !Ref BastionInstanceProfile
+        SecurityGroupIds: [!Ref BastionSecurityGroup]
+        Tags:
+          - { Key: Name, Value: modaco-db-tunnel-bastion }
+
+    # --- Database -----------------------------------------------------------
+    # Shares the same Postgres instance as the main Express API (see
+    # prisma/schema.prisma). Lambdas go through RDS Proxy instead of
+    # connecting directly: a burst of ~250 concurrent batch invocations would
+    # otherwise open 250 raw Postgres connections at once, which a small
+    # instance's max_connections cannot absorb. See ADR.md, Scenario A.
+    DbSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+        Description: Master credentials for the ModaCo Postgres instance
+        GenerateSecretString:
+          SecretStringTemplate: '{"username": "modaco_admin"}'
+          GenerateStringKey: password
+          PasswordLength: 24
+          ExcludeCharacters: '"@/\\'
+
+    DbSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Private subnets for the ModaCo Postgres instance
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+    PostgresInstance:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Snapshot
+      Properties:
+        Engine: postgres
+        EngineVersion: "16"
+        DBInstanceClass: db.t4g.micro
+        AllocatedStorage: "20"
+        DBName: modaco
+        MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+        MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+        DBSubnetGroupName: !Ref DbSubnetGroup
+        VPCSecurityGroups: [!Ref DbSecurityGroup]
+        PubliclyAccessible: false
+        BackupRetentionPeriod: 1
+        MultiAZ: false
+
+    DbProxyIamRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: { Service: rds.amazonaws.com }
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: DbProxySecretAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: [secretsmanager:GetSecretValue]
+                  Resource: !Ref DbSecret
+
+    DbProxy:
+      Type: AWS::RDS::DBProxy
+      Properties:
+        DBProxyName: modaco-ingestion-proxy
+        EngineFamily: POSTGRESQL
+        RoleArn: !GetAtt DbProxyIamRole.Arn
+        VpcSubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+        RequireTLS: true
+        Auth:
+          - AuthScheme: SECRETS
+            SecretArn: !Ref DbSecret
+            IAMAuth: DISABLED
+
+    DbProxyTargetGroup:
+      Type: AWS::RDS::DBProxyTargetGroup
+      Properties:
+        DBProxyName: !Ref DbProxy
+        DBInstanceIdentifiers: [!Ref PostgresInstance]
+        TargetGroupName: default
+        ConnectionPoolConfigurationInfo:
+          MaxConnectionsPercent: 90
+          MaxIdleConnectionsPercent: 50
+
+    # --- Storage & messaging --------------------------------------------
+    VendorUploadsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: modaco-vendor-uploads-${self:provider.stage}-${aws:accountId}
+        LifecycleConfiguration:
+          Rules:
+            - Id: ExpireProcessedFiles
+              Status: Enabled
+              ExpirationInDays: 30
+
+    IngestionBatchDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        MessageRetentionPeriod: 1209600 # 14 days — long enough to inspect/replay failed batches manually
+
+    IngestionBatchQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 150 # > processBatch timeout, so a slow batch isn't picked up twice
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt IngestionBatchDLQ.Arn
+          maxReceiveCount: 3
+
+  Outputs:
+    VendorUploadsBucketName:
+      Value: !Ref VendorUploadsBucket
+    IngestionBatchQueueUrl:
+      Value: !Ref IngestionBatchQueue
+    DbProxyEndpoint:
+      Value: !GetAtt DbProxy.Endpoint
+    DbSecretArn:
+      Value: !Ref DbSecret
+    BastionInstanceId:
+      Value: !Ref BastionInstance
