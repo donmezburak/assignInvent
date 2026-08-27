@@ -42,13 +42,16 @@ export const handler: SQSHandler = async (event): Promise<SQSBatchResponse> => {
 async function processOneBatch(pool: Awaited<ReturnType<typeof getPool>>, message: BatchMessage) {
   const { jobId, batchIndex, bucket, key, startByte, endByte } = message;
 
+  // Fast path only: skips the S3 fetch/parse below for the common case (a
+  // batch that already completed on a prior attempt). Not authoritative by
+  // itself — two invocations could both pass this check before either
+  // commits (e.g. duplicate SQS messages from a re-triggered `splitFile`
+  // run processed concurrently). The FOR UPDATE re-check inside the
+  // transaction below is what actually closes that race.
   const existing = await pool.query(
     `SELECT status FROM ingestion_batches WHERE "jobId" = $1 AND "batchIndex" = $2`,
     [jobId, batchIndex],
   );
-  // At-least-once delivery: SQS (or a Lambda retry after a timeout) can
-  // redeliver a message whose batch already completed successfully. Without
-  // this check we'd double-count rowCount into the job's processedRows.
   if (existing.rows[0]?.status === "COMPLETED") {
     console.log("Batch already completed, skipping", { jobId, batchIndex });
     return;
@@ -73,6 +76,24 @@ async function processOneBatch(pool: Awaited<ReturnType<typeof getPool>>, messag
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    // Authoritative check: FOR UPDATE locks this one ingestion_batches row
+    // for the rest of the transaction — it does not touch products,
+    // categories, or any other batch's row, so normal API traffic is
+    // unaffected. If a concurrent invocation is processing the same
+    // (jobId, batchIndex) right now, its own FOR UPDATE blocks here until
+    // this transaction commits or rolls back, then re-reads the
+    // now-committed status and finds COMPLETED — closing the race the
+    // pre-check above can't close on its own.
+    const locked = await client.query(
+      `SELECT status FROM ingestion_batches WHERE "jobId" = $1 AND "batchIndex" = $2 FOR UPDATE`,
+      [jobId, batchIndex],
+    );
+    if (locked.rows[0]?.status === "COMPLETED") {
+      await client.query("ROLLBACK");
+      console.log("Batch already completed (caught under lock), skipping", { jobId, batchIndex });
+      return;
+    }
 
     const categoryIds = await upsertCategories(client, [...new Set(rows.map((r) => r.category))]);
     await bulkUpsertProducts(client, rows, categoryIds);
