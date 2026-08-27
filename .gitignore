@@ -11,3 +11,7 @@ uploads/
 # Assignment brief materials (not part of the deliverable)
 *.pdf
 *.docx
+
+# Serverless Framework build artifacts
+.serverless/
+.esbuild/
