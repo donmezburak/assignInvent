@@ -1,10 +1,12 @@
 import { Request, Response } from "express";
-import { createUploadSchema } from "./ingestion.dto";
+import { AppError } from "../../middleware/errorHandler";
 import * as ingestionService from "./ingestion.service";
 
-export async function createUpload(req: Request, res: Response) {
-  const input = createUploadSchema.parse(req.body);
-  const result = await ingestionService.createUpload(input);
+export async function uploadFile(req: Request, res: Response) {
+  const fileName = req.header("x-file-name");
+  if (!fileName) throw new AppError(400, "MISSING_X_FILE_NAME_HEADER");
+
+  const result = await ingestionService.uploadVendorFile(fileName, req);
   res.status(201).json(result);
 }
 

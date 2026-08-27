@@ -4,5 +4,5 @@ import * as ingestionController from "./ingestion.controller";
 
 export const ingestionRouter = Router();
 
-ingestionRouter.post("/uploads", asyncHandler(ingestionController.createUpload));
+ingestionRouter.post("/uploads", asyncHandler(ingestionController.uploadFile));
 ingestionRouter.get("/jobs/:jobId", asyncHandler(ingestionController.getStatus));

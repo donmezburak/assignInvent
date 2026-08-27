@@ -1,15 +1,21 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { S3Client } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
+import type { Readable } from "node:stream";
 
 export const s3 = new S3Client({});
 
 /**
- * Presigned PUT URL so the client uploads the vendor file straight to S3.
- * The file never passes through this API (or any Lambda) in-line with a
- * request — required given a 500k-row file would blow past both this
- * process's and a Lambda's memory/timeout if proxied. See ADR.md, Scenario A.
+ * Streams `body` straight to S3 without ever buffering the whole file in
+ * this process's memory — `Upload` handles S3's multipart upload protocol
+ * (chunking, retries) internally, so this stays memory-flat regardless of
+ * file size. This is what lets a single "just upload the file" endpoint
+ * accept a large vendor file without reintroducing the memory risk Scenario
+ * A's serverless ingestion pipeline is built to avoid — see ADR.md.
  */
-export function createUploadUrl(bucket: string, key: string, expiresInSeconds = 300) {
-  const command = new PutObjectCommand({ Bucket: bucket, Key: key });
-  return getSignedUrl(s3, command, { expiresIn: expiresInSeconds });
+export async function streamUploadToS3(bucket: string, key: string, body: Readable): Promise<void> {
+  const upload = new Upload({
+    client: s3,
+    params: { Bucket: bucket, Key: key, Body: body },
+  });
+  await upload.done();
 }

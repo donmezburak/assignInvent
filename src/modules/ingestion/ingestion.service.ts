@@ -1,27 +1,28 @@
 import { randomUUID } from "node:crypto";
+import type { Readable } from "node:stream";
 import { env } from "../../config/env";
 import { AppError } from "../../middleware/errorHandler";
-import { createUploadUrl } from "../../lib/s3";
+import { streamUploadToS3 } from "../../lib/s3";
 import { prisma } from "../../lib/prisma";
-import { CreateUploadInput } from "./ingestion.dto";
 
 /**
- * Issues a presigned upload URL and the key convention that `splitFile`
- * (ingestion-service) parses to recover the job id — see
- * ingestion-service/src/handlers/splitFile.ts. No `ingestion_jobs` row is
- * created here: it doesn't exist until `splitFile` actually runs, so job
- * status is "not found" until the file has actually landed in S3.
+ * The client's whole interaction is this one call: send the file, get a
+ * jobId back. The request body is streamed straight through to S3 (see
+ * streamUploadToS3) — this API never holds the file in memory, so the size
+ * of a "reasonable" vendor file doesn't threaten this process regardless of
+ * how large it gets. `splitFile` (ingestion-service) picks up from here via
+ * the S3 event, using the same key convention this generates.
  */
-export async function createUpload(input: CreateUploadInput) {
+export async function uploadVendorFile(fileName: string, body: Readable) {
   if (!env.ingestionBucket) {
     throw new AppError(500, "INGESTION_BUCKET_NOT_CONFIGURED");
   }
 
   const jobId = randomUUID();
-  const key = `vendor-files/${jobId}/${input.fileName}`;
-  const uploadUrl = await createUploadUrl(env.ingestionBucket, key);
+  const key = `vendor-files/${jobId}/${fileName}`;
+  await streamUploadToS3(env.ingestionBucket, key, body);
 
-  return { jobId, uploadUrl, key };
+  return { jobId };
 }
 
 export async function getJobStatus(jobId: string) {
