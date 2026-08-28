@@ -303,6 +303,43 @@ resources:
         BackupRetentionPeriod: 1
         MultiAZ: false
 
+    # --- Cache (Scenario B) -----------------------------------------------
+    # Redis for the main API's read cache (list-endpoint version-bumped
+    # cache, per-product/category active-promotion cache). Only the main API
+    # talks to this — none of the ingestion Lambdas do — but it lives in
+    # this same VPC/stack so it can share the private subnets and the
+    # bastion tunnel already set up for RDS, instead of standing up a
+    # second network. No AUTH token: access control is network-level only
+    # (private subnet + security group), matching the trust boundary already
+    # used for Postgres in this stack.
+    CacheSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Redis, reachable only from the bastion tunnel (local API dev)
+        VpcId: !Ref IngestionVpc
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 6379
+            ToPort: 6379
+            SourceSecurityGroupId: !Ref BastionSecurityGroup
+
+    CacheSubnetGroup:
+      Type: AWS::ElastiCache::SubnetGroup
+      Properties:
+        Description: Private subnets for the ModaCo Redis cache
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+    RedisCache:
+      Type: AWS::ElastiCache::CacheCluster
+      Properties:
+        Engine: redis
+        CacheNodeType: cache.t3.micro
+        NumCacheNodes: 1
+        CacheSubnetGroupName: !Ref CacheSubnetGroup
+        VpcSecurityGroupIds: [!Ref CacheSecurityGroup]
+
     # --- Storage & messaging --------------------------------------------
     VendorUploadsBucket:
       Type: AWS::S3::Bucket
@@ -375,3 +412,5 @@ resources:
       Value: !Ref BastionInstance
     IngestionAlertsTopicArn:
       Value: !Ref IngestionAlertsTopic
+    RedisEndpoint:
+      Value: !GetAtt RedisCache.RedisEndpoint.Address

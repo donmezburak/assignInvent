@@ -1,6 +1,15 @@
 import { PromotionScope, PromotionStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { AppError } from "../../middleware/errorHandler";
+import {
+  activePromoCategoryKey,
+  activePromoProductKey,
+  bumpVersion,
+  cacheDelete,
+  cacheGetOrSet,
+  CATALOG_LIST_VERSION_KEY,
+} from "../../lib/redis";
+import { env } from "../../config/env";
 import { computeEffectivePrice } from "../pricing/pricing.engine";
 import { AssignPromotionInput, CreatePromotionInput } from "./promotion.dto";
 import * as promotionRepo from "./promotion.repository";
@@ -20,7 +29,7 @@ export async function createPromotion(input: CreatePromotionInput) {
   // Serialize conflict-check + insert in a transaction so two concurrent
   // "create promotion" requests for the same product/category can't both
   // pass the overlap check and violate "at most one active promotion".
-  return prisma.$transaction(async (tx) => {
+  const promotion = await prisma.$transaction(async (tx) => {
     const overlapping = await promotionRepo.findOverlappingActive(
       scope,
       targetId,
@@ -49,6 +58,9 @@ export async function createPromotion(input: CreatePromotionInput) {
       tx,
     );
   });
+
+  await invalidateFor(scope, targetId);
+  return promotion;
 }
 
 export async function cancelPromotion(id: string) {
@@ -58,7 +70,9 @@ export async function cancelPromotion(id: string) {
     throw new AppError(409, "PROMOTION_ALREADY_CANCELLED");
   }
 
-  return promotionRepo.cancelPromotion(id);
+  const cancelled = await promotionRepo.cancelPromotion(id);
+  await invalidateFor(promotion.scope, (promotion.productId ?? promotion.categoryId) as string);
+  return cancelled;
 }
 
 /**
@@ -87,7 +101,7 @@ export async function assignPromotion(id: string, input: AssignPromotionInput) {
     if (!category) throw new AppError(404, "CATEGORY_NOT_FOUND");
   }
 
-  return prisma.$transaction(async (tx) => {
+  const updated = await prisma.$transaction(async (tx) => {
     const overlapping = await promotionRepo.findOverlappingActive(
       scope,
       targetId,
@@ -105,6 +119,27 @@ export async function assignPromotion(id: string, input: AssignPromotionInput) {
 
     return promotionRepo.assignPromotionTarget(id, scope, input.productId ?? null, input.categoryId ?? null, tx);
   });
+
+  // Both the old target (which no longer has this promotion) and the new
+  // target (which now does) need their cached active-promotion entry
+  // dropped.
+  await invalidateFor(promotion.scope, (promotion.productId ?? promotion.categoryId) as string);
+  await invalidateFor(scope, targetId);
+  return updated;
+}
+
+async function invalidateFor(scope: PromotionScope, targetId: string) {
+  // List results (sorted by effective price) can shift for any promotion
+  // change, and list cache keys can't be enumerated to delete individually
+  // — so bump the shared version instead (see lib/redis.ts).
+  await bumpVersion(CATALOG_LIST_VERSION_KEY);
+
+  // The active-promotion cache, by contrast, has exactly one entry for this
+  // exact product/category, so a direct delete is precise and cheap — this
+  // is what keeps "50% off Accessories" from having to touch 50,000 rows or
+  // cache keys: only this single key changes.
+  const key = scope === PromotionScope.PRODUCT ? activePromoProductKey(targetId) : activePromoCategoryKey(targetId);
+  await cacheDelete(key);
 }
 
 /**
@@ -117,6 +152,11 @@ export async function assignPromotion(id: string, input: AssignPromotionInput) {
  * promotion can be edited after a product promotion was created and become
  * the better deal, or vice versa; a fixed "product always wins" rule would
  * keep applying the worse discount until someone noticed. See ADR.md.
+ *
+ * Cached per product and per category (not per product alone) — during a
+ * flash sale, every one of the 50,000 affected products resolves to the
+ * *same* `promo:active:category:{id}` cache entry, so this stays a single
+ * hot key instead of 50,000 independent ones.
  */
 export async function resolveActivePromotionForProduct(
   productId: string,
@@ -125,8 +165,12 @@ export async function resolveActivePromotionForProduct(
   at: Date = new Date(),
 ) {
   const [direct, category] = await Promise.all([
-    promotionRepo.findActiveProductPromotion(productId, at),
-    promotionRepo.findActiveCategoryPromotion(categoryId, at),
+    cacheGetOrSet(activePromoProductKey(productId), env.cacheTtlActivePromoSeconds, () =>
+      promotionRepo.findActiveProductPromotion(productId, at),
+    ),
+    cacheGetOrSet(activePromoCategoryKey(categoryId), env.cacheTtlActivePromoSeconds, () =>
+      promotionRepo.findActiveCategoryPromotion(categoryId, at),
+    ),
   ]);
 
   if (!direct) return category;
