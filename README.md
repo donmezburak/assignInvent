@@ -4,6 +4,7 @@ Internal API for product catalog and promotions (seasonal discounts, flash
 sales), built as a case study covering product/promotion management, a large-file
 vendor ingestion pipeline , and flash-sale read scaling .
 See `ADR.md` for architectural decisions and `AI_APPENDIX.md` for the AI usage report.
+Database schema (DDL): `prisma/schema.prisma` and the generated SQL in `prisma/migrations/`.
 
 ## Tech stack
 

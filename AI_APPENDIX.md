@@ -46,7 +46,7 @@ process down in more detail.
 
 | Model / Tool | Primary Purpose of Use | Effectiveness (1-5) & Brief Why |
 |---|---|---|
-| Claude Sonnet 5 (via Claude Code CLI) | End-to-end: system design, code generation, real AWS deployment and debugging, live functional/load testing | **5** — the only tool used; it could drive AWS CLI, run local databases, and execute real load tests itself, so every design claim below was verified live rather than left as an assumption. |
+| Claude Sonnet 5 (via Claude Code CLI) | End-to-end: system design, code generation, real AWS deployment and debugging, live functional/load testing | **4** — the only tool used; it could drive AWS CLI, run local databases, and execute real load tests itself, so every design claim below was verified live rather than left as an assumption. |
 
 ## 2. AI Tool Usage Approach
 
