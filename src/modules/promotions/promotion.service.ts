@@ -1,4 +1,4 @@
-import { PromotionScope, PromotionStatus } from "@prisma/client";
+import { Prisma, PromotionScope, PromotionStatus } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { AppError } from "../../middleware/errorHandler";
 import {
@@ -13,6 +13,28 @@ import { env } from "../../config/env";
 import { computeEffectivePrice } from "../pricing/pricing.engine";
 import { AssignPromotionInput, CreatePromotionInput } from "./promotion.dto";
 import * as promotionRepo from "./promotion.repository";
+
+/**
+ * Serializes any two transactions racing to create/reassign a promotion
+ * onto the same target (product or category). `findOverlappingActive` +
+ * insert alone is a check-then-act that Postgres's default READ COMMITTED
+ * isolation does not protect: two concurrent transactions can each run the
+ * overlap SELECT before either commits its INSERT, so neither sees the
+ * other's row, and both succeed — verified live, this let two overlapping
+ * product-level promotions both land as ACTIVE on the same product.
+ *
+ * `FOR UPDATE` (used elsewhere, e.g. ingestion batches) doesn't apply here
+ * because there may be no existing row to lock — the very first promotion
+ * for a product has nothing to select. A Postgres advisory lock keyed by
+ * the target id has no such requirement: it locks the *id itself*, present
+ * row or not, and is released automatically at commit/rollback
+ * (`pg_advisory_xact_lock`). The second transaction blocks until the first
+ * finishes, then its own overlap check correctly sees the just-committed
+ * row.
+ */
+async function lockTarget(tx: Prisma.TransactionClient, targetId: string): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${targetId})::bigint)`;
+}
 
 export async function createPromotion(input: CreatePromotionInput) {
   const scope = input.productId ? PromotionScope.PRODUCT : PromotionScope.CATEGORY;
@@ -30,6 +52,8 @@ export async function createPromotion(input: CreatePromotionInput) {
   // "create promotion" requests for the same product/category can't both
   // pass the overlap check and violate "at most one active promotion".
   const promotion = await prisma.$transaction(async (tx) => {
+    await lockTarget(tx, targetId);
+
     const overlapping = await promotionRepo.findOverlappingActive(
       scope,
       targetId,
@@ -102,6 +126,8 @@ export async function assignPromotion(id: string, input: AssignPromotionInput) {
   }
 
   const updated = await prisma.$transaction(async (tx) => {
+    await lockTarget(tx, targetId);
+
     const overlapping = await promotionRepo.findOverlappingActive(
       scope,
       targetId,
