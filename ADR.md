@@ -6,7 +6,7 @@
 - **Single database**, no local/prod split — main API and the ingestion pipeline share one RDS instance (private; local dev via SSM tunnel).
 - **Two deployables:** `/` (REST API, long-running Express) and `/ingestion-service` (Serverless Framework: Lambda + S3 + SQS + SNS, Scenario A).
 
-## 2. Domain model (§1)
+## 2. Domain model (1)
 
 - **Category is a table, not a string** — promotions need a real FK to target "an entire category," and Scenario B needs a stable join target for new products.
 - **Effective price is never stored.** Resolved at read time, always. This means Scenario A ingestion never touches promotions (no join, no lookup), and Scenario B's category promotions never require updating the products they affect (single `INSERT`, no write amplification).
@@ -24,8 +24,8 @@
 - **Process:** `processBatch` fetches its byte range, applies `applyDynamicPricingRules` in memory *before* any write (the case study's core requirement), then bulk-upserts. Bulk insert first; on failure, falls back to per-row savepoints so one bad row doesn't cost its other ~1,999. Idempotent via a pre-check plus `SELECT ... FOR UPDATE` on the batch's own row (closes a redelivery race without locking `products` or other batches).
 - **Stateless, proven live:** all progress lives in `ingestion_jobs`/`ingestion_batches`, never Lambda memory. In a real run, one batch's Lambda hit its own timeout under DB contention, died mid-work, and a fresh container picked it up correctly after SQS's visibility timeout — no data lost, no manual fix.
 - **Permanent failures are visible:** after 3 SQS attempts, a batch lands in a DLQ consumed by `handleFailedBatch` — the *only* place `failedRows` is incremented (counting inline would double-count retries that later succeed) — which also fires an SNS alert.
-- **RDS Proxy** was the original plan for connection pooling; unavailable on this AWS account's plan (discovered at deploy). This account's own Lambda concurrency cap (10) substitutes as the connection guard — correctness holds, but a 500k-row run takes minutes here instead of the tens of seconds it would on an unrestricted account.
-- **Live results:** 500k rows via direct S3 upload — 52s, 0 failures. Via the streaming API endpoint — ~5m21s (one batch retried after a timeout), 0 failures. Re-uploading the same 500k SKUs still produced exactly 500,000 products (upsert, not duplication).
+- **RDS Proxy** was the original plan for connection pooling; unavailable on this AWS account's plan. My account own Lambda concurrency cap (10) substitutes as the connection guard — correctness holds, but a 500k-row run takes minutes here instead of the tens of seconds it would on an unrestricted account.
+- **Live results:** 500k rows via direct S3 upload — 52s, 0 failures. Via the streaming API endpoint — ~3m21s (one batch retried after a timeout), 0 failures. Re-uploading the same 500k SKUs still produced exactly 500,000 products (upsert, not duplication).
 
 ## 4. Scenario B — Flash Sales
 
@@ -57,7 +57,7 @@ Correctness+speed re-verified at a real 50,000-product single category (66ms fir
 
 | Decision | Why | Cost |
 |---|---|---|
-| No RDS Proxy | Unavailable on this AWS account's plan | Lambda concurrency cap substitutes as the connection guard |
+| No RDS Proxy | Unavailable on my account's plan | Lambda concurrency cap substitutes as the connection guard |
 | Raw SQL for product listing | Prisma can't express `ORDER BY` a computed cross-table value | Loses query-builder type-safety there; mitigated with a typed return shape |
 | Streaming upload vs. presigned URL | Single client call | File bytes pass through the API process (streamed, not buffered) |
 | Redis cache-aside vs. denormalized price / materialized view | Instant, cheap invalidation (one key delete) | Bounded staleness on TTL entries; adds Redis as an operational dependency |
